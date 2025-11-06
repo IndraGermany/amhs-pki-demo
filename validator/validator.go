@@ -146,6 +146,9 @@ func (v *Validator) validateCA(cert *x509.Certificate, result *ValidationResult)
 		result.Errors = append(result.Errors, "Subject CN is required")
 	}
 	result.Info = append(result.Info, fmt.Sprintf("Subject: %s", cert.Subject))
+
+	// Verify certificate chain to Root CA
+	v.verifyChainToRoot(cert, result, "ca")
 }
 
 func (v *Validator) validateMTA(cert *x509.Certificate, result *ValidationResult) {
@@ -253,6 +256,9 @@ func (v *Validator) validateMTA(cert *x509.Certificate, result *ValidationResult
 	}
 
 	result.Info = append(result.Info, fmt.Sprintf("Subject: %s", cert.Subject))
+
+	// Verify certificate chain to Root CA
+	v.verifyChainToRoot(cert, result, "mta")
 }
 
 func (v *Validator) validateSigning(cert *x509.Certificate, result *ValidationResult) {
@@ -344,12 +350,15 @@ func (v *Validator) validateSigning(cert *x509.Certificate, result *ValidationRe
 	// Check validity (1-3 years typical)
 	validityDays := int(cert.NotAfter.Sub(cert.NotBefore).Hours() / 24)
 	result.Info = append(result.Info, fmt.Sprintf("Validity period: %d days (~%.1f years)", validityDays, float64(validityDays)/365))
-	
+
 	if validityDays > 1095 {
 		result.Warnings = append(result.Warnings, "Signing certificate validity should typically be 1-3 years")
 	}
 
 	result.Info = append(result.Info, fmt.Sprintf("Subject: %s", cert.Subject))
+
+	// Verify certificate chain to Root CA
+	v.verifyChainToRoot(cert, result, "signing")
 }
 
 // DisplayCertificateInfo displays detailed information about a certificate
@@ -487,4 +496,127 @@ func (v *Validator) loadCertificate(certFile string) (*x509.Certificate, error) 
 	}
 
 	return cert, nil
+}
+
+// loadRootCA attempts to load the Root CA certificate from known locations
+func (v *Validator) loadRootCA() (*x509.Certificate, error) {
+	// Try loading from current directory first
+	possiblePaths := []string{
+		"root-demo.crt",
+		"../root-demo.crt",
+		"../../root-demo.crt",
+	}
+
+	for _, path := range possiblePaths {
+		cert, err := v.loadCertificate(path)
+		if err == nil {
+			return cert, nil
+		}
+	}
+
+	return nil, fmt.Errorf("failed to load Root CA certificate (tried: %v)", possiblePaths)
+}
+
+// loadIssuingCA attempts to load the AMHS Issuing CA certificate from known locations
+func (v *Validator) loadIssuingCA() (*x509.Certificate, error) {
+	// Try loading from current directory first
+	possiblePaths := []string{
+		"amhs-ca.crt",
+		"issuing-ca.crt",
+		"../amhs-ca.crt",
+		"../issuing-ca.crt",
+		"../../amhs-ca.crt",
+		"../../issuing-ca.crt",
+	}
+
+	for _, path := range possiblePaths {
+		cert, err := v.loadCertificate(path)
+		if err == nil {
+			return cert, nil
+		}
+	}
+
+	return nil, fmt.Errorf("failed to load AMHS Issuing CA certificate (tried: %v)", possiblePaths)
+}
+
+// verifySelfSigned verifies that a certificate is self-signed
+func (v *Validator) verifySelfSigned(cert *x509.Certificate, result *ValidationResult) {
+	err := cert.CheckSignatureFrom(cert)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("Self-signature verification failed: %v", err))
+	} else {
+		result.Info = append(result.Info, "✓ Certificate is properly self-signed")
+	}
+}
+
+// verifySignedBy verifies that cert was signed by issuer
+func (v *Validator) verifySignedBy(cert, issuer *x509.Certificate, result *ValidationResult, certDesc string) {
+	err := cert.CheckSignatureFrom(issuer)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("Signature verification failed for %s: %v", certDesc, err))
+	} else {
+		result.Info = append(result.Info, fmt.Sprintf("✓ Signature verified: %s signed by %s", certDesc, issuer.Subject.CommonName))
+	}
+}
+
+// verifyChainToRoot verifies the complete certificate chain to the Root CA
+func (v *Validator) verifyChainToRoot(cert *x509.Certificate, result *ValidationResult, certType string) {
+	result.Info = append(result.Info, "")
+	result.Info = append(result.Info, "Verifying certificate chain to Root CA...")
+
+	switch certType {
+	case "ca":
+		// AMHS Issuing CA should be signed by Root CA
+		rootCA, err := v.loadRootCA()
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("Cannot verify chain: %v", err))
+			return
+		}
+
+		// Verify AMHS CA is signed by Root CA
+		v.verifySignedBy(cert, rootCA, result, "AMHS Issuing CA")
+
+		// Verify Root CA is self-signed
+		result.Info = append(result.Info, "")
+		result.Info = append(result.Info, "Verifying Root CA is self-signed...")
+		v.verifySelfSigned(rootCA, result)
+
+		result.Info = append(result.Info, "")
+		result.Info = append(result.Info, "✓ Certificate chain verified successfully:")
+		result.Info = append(result.Info, fmt.Sprintf("  └─> %s", rootCA.Subject.CommonName))
+		result.Info = append(result.Info, fmt.Sprintf("      └─> %s (this certificate)", cert.Subject.CommonName))
+
+	case "mta", "signing":
+		// End-entity certificates should be signed by AMHS Issuing CA
+		issuingCA, err := v.loadIssuingCA()
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("Cannot verify chain: %v", err))
+			return
+		}
+
+		// Verify end-entity cert is signed by Issuing CA
+		v.verifySignedBy(cert, issuingCA, result, cert.Subject.CommonName)
+
+		// Now verify Issuing CA is signed by Root CA
+		result.Info = append(result.Info, "")
+		result.Info = append(result.Info, "Verifying Issuing CA chain...")
+		rootCA, err := v.loadRootCA()
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("Cannot verify chain to root: %v", err))
+			return
+		}
+
+		v.verifySignedBy(issuingCA, rootCA, result, "AMHS Issuing CA")
+
+		// Verify Root CA is self-signed
+		result.Info = append(result.Info, "")
+		result.Info = append(result.Info, "Verifying Root CA is self-signed...")
+		v.verifySelfSigned(rootCA, result)
+
+		result.Info = append(result.Info, "")
+		result.Info = append(result.Info, "✓ Certificate chain verified successfully:")
+		result.Info = append(result.Info, fmt.Sprintf("  └─> %s", rootCA.Subject.CommonName))
+		result.Info = append(result.Info, fmt.Sprintf("      └─> %s", issuingCA.Subject.CommonName))
+		result.Info = append(result.Info, fmt.Sprintf("          └─> %s (this certificate)", cert.Subject.CommonName))
+	}
 }
