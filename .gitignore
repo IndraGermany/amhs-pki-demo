@@ -1,0 +1,37 @@
+# Binaries
+amhs-pki-demo
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output certificates and keys
+*.crt
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Root CA (should be regenerated)
+root-demo.*
+
+# Generated certificates
+amhs-ca.*
+mta-*
+ua-*
+mtcu-*
+issuing-ca.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
